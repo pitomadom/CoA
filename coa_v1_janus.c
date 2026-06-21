@@ -189,6 +189,16 @@ static int coa_immune_init(lg_field_t* f, const coa_origin* org, uint64_t seed) 
     int rc = lg_field_init(f, COA_LG_EXPERTS, seed);
     if (rc != 0) return rc;
 
+    /* M4 (Mythos audit): corpus-specific verdict thresholds live HERE in the
+     * host, not in the vendored loragrad (which keeps canon defaults 0.40/0.10).
+     * Tuned 2026-05-06 for the DoE corpus (origin·boundary +0.34, sample scores
+     * +0.10..+0.30); canon +0.40 gave 0 PASS verdicts in Phase-1 smoke. This is
+     * the threshold-drift fix: the corpus knob is explicit and recalibratable,
+     * not buried as a vendor edit. RECALIBRATE on the weave corpus before the
+     * from-scratch train (PLAN risk #2). */
+    f->thresh_pass   = 0.20f;
+    f->thresh_weaken = 0.05f;
+
     lg_field_set_origin_from_sketches(f, org->sketches, org->n_lines);
 
     int n_b = 0;
@@ -435,12 +445,28 @@ static int coa_forward(coa_model* m, int* tokens, int* targets) {
 
 typedef struct {
     int total, passed, weakened, blocked;
+    int frozen, n_params, nans;   /* opp3 (Mythos audit): per-run Chuck-freeze + NaN telemetry */
 } coa_train_stats;
 
 static double coa_now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+/* opp3 (Mythos audit): count Chuck-frozen params on the live tape. Reads
+ * nt_tape_get()->chuck_params directly — no notorch change, no vendor drift.
+ * Valid only while n_params is set (between a forward and the next tape_clear,
+ * which resets the count), so coa_train samples it inside the loop. A non-zero
+ * count under a sustained blocked burst would be the LG-H1 permanent-freeze
+ * trap; CoA skips Chuck on blocked verdicts, so this stays 0. */
+static int coa_count_frozen(void) {
+    nt_tape* tp = nt_tape_get();
+    if (!tp) return 0;
+    int n = 0;
+    for (int i = 0; i < tp->n_params; ++i)
+        if (tp->chuck_params[i].frozen) n++;
+    return n;
 }
 
 /* LG-H2: scale every gradient on the active tape by `scale`. Applies WEAKEN's
@@ -470,7 +496,7 @@ static void coa_scale_all_grads(float scale) {
     }
 }
 
-static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
+static coa_train_stats coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
                       int* encoded, int n_chars, int steps, int gating_off)
 {
     printf("\n══════════════════════════════════════════════════════════════════\n");
@@ -586,6 +612,14 @@ static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
             stats.blocked++;
         }
 
+        /* opp3: sample Chuck freeze state while n_params is still valid —
+         * nt_tape_clear() below resets the count. Track the running peak so a
+         * freeze that latches mid-run is caught even if a later step unregisters. */
+        { int fz = coa_count_frozen();
+          if (fz > stats.frozen) stats.frozen = fz;
+          int np = nt_tape_get()->n_params;
+          if (np > stats.n_params) stats.n_params = np; }
+
         nt_tape_clear();
 
         /* ── Logging ───────────────────────────────────────────────────── */
@@ -599,12 +633,18 @@ static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
     }
 
     double elapsed = (coa_now_ms() - t0) / 1000.0;
+    stats.nans = guard.total_nan_count;
     printf("\n── training complete ──\n");
     printf("  loss: %.4f → %.4f (best %.4f)\n", first_loss, loss_ema, best_loss);
     printf("  time: %.1fs (%.1f steps/s)\n", elapsed, steps / elapsed);
     printf("  loragrad: %d total, %d PASS, %d WEAKEN, %d blocked\n",
            stats.total, stats.passed, stats.weakened, stats.blocked);
-    printf("  nans: %d\n", guard.total_nan_count);
+    /* opp3 (Mythos audit): Chuck freeze telemetry. A non-zero peak under a
+     * blocked burst would be the LG-H1 permanent-freeze trap; CoA skips Chuck
+     * on blocked verdicts, so this stays 0 — surfaced instead of staying silent. */
+    printf("  chuck frozen params (peak): %d / %d\n", stats.frozen, stats.n_params);
+    printf("  nans: %d\n", stats.nans);
+    return stats;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -823,7 +863,7 @@ int main(int argc, char** argv) {
     /* Read training corpus. argv[3] = optional path; default = origin.txt
      * If path ends in `.tokens` → load pre-encoded binary [int32 n][int32*n].
      * Otherwise → load text and BPE-encode in-process (fast post-fix). */
-    const char* corpus_path = (argc > 3) ? argv[3] : origin_path;
+    const char* corpus_path = (argc > 3 && strncmp(argv[3], "--", 2) != 0) ? argv[3] : origin_path;
     int   n_tokens = 0;
     int*  encoded = NULL;
     long  corpus_sz = 0;
@@ -876,6 +916,68 @@ int main(int argc, char** argv) {
     printf("[L1]  model: %d layers, %d embd, %d heads, %d params (%.2fM)\n",
            model.n_layer, model.n_embd, model.n_head,
            coa_param_count(&model), coa_param_count(&model) / 1000000.0);
+
+    /* ── LG-H1/H2 grad-path regression (Mythos audit): --immune-burst ──────────
+     * The audit's prescribed verify CoA had never run: route REAL gradients
+     * through the verdict gate under a SUSTAINED adversarial burst — the exact
+     * scenario that permanently froze loragrad's own harness (Chuck on zeroed
+     * grads → freeze latch). CoA skips Chuck on blocked verdicts, so it must
+     * survive: blocked grad-paths execute, no param freezes (H1), no NaN.
+     * burst_steps (16) > NT_CHUCK_STAG_STEPS (8) so a freeze would have latched. */
+    {
+        int immune_burst = 0;
+        for (int i = 1; i < argc; ++i)
+            if (strcmp(argv[i], "--immune-burst") == 0) immune_burst = 1;
+        if (immune_burst) {
+            printf("\n══ LG-H1/H2 grad-path regression — sustained adversarial burst ══\n");
+            char advbuf[8192]; int adv_off = 0;
+            while (adv_off < (int)sizeof(advbuf) - 256) {
+                for (int s = 0; COA_BOUNDARY_SEED[s]; ++s) {
+                    int l = (int)strlen(COA_BOUNDARY_SEED[s]);
+                    if (adv_off + l + 1 >= (int)sizeof(advbuf)) break;
+                    memcpy(advbuf + adv_off, COA_BOUNDARY_SEED[s], (size_t)l); adv_off += l;
+                    advbuf[adv_off++] = '\n';
+                }
+            }
+            advbuf[adv_off] = 0;
+            int* adv_enc = (int*)malloc((size_t)adv_off * sizeof(int));
+            int  adv_n   = nt_bpe_encode(&bpe, advbuf, adv_off, adv_enc, adv_off);
+            printf("  adversarial corpus: %d bytes → %d BPE tokens (all boundary-aligned)\n",
+                   adv_off, adv_n);
+            if (adv_n < COA_BLOCK_SIZE + 2) {
+                fprintf(stderr, "  FAIL: adversarial corpus too small (%d < %d)\n",
+                        adv_n, COA_BLOCK_SIZE + 2);
+                free(adv_enc); free(encoded);
+                coa_model_free(&model); lg_field_free(&field); coa_origin_free(&org);
+#ifdef USE_CUDA
+                if (nt_get_gpu_mode()) gpu_shutdown();
+#endif
+                return 4;
+            }
+            lg_field_reset_counters(&field);
+            lg_field_reset_memory(&field);
+            coa_train_stats st = coa_train(&model, &field, &bpe, adv_enc, adv_n, 16, /*gating_off=*/0);
+            free(adv_enc);
+            int fired    = (st.weakened + st.blocked) > 0;
+            int nofreeze = (st.frozen == 0);
+            int nonan    = (st.nans == 0);
+            printf("\n  ── regression verdict ──\n");
+            printf("  grad-paths fired  (weaken+blocked>0): %-3s  (%d)\n",
+                   fired ? "yes" : "NO", st.weakened + st.blocked);
+            printf("  H1 no perma-freeze (frozen==0):       %-3s  (%d/%d)\n",
+                   nofreeze ? "yes" : "NO", st.frozen, st.n_params);
+            printf("  no NaN (nans==0):                     %-3s  (%d)\n",
+                   nonan ? "yes" : "NO", st.nans);
+            int ok = fired && nofreeze && nonan;
+            printf("\n  IMMUNE GRAD-PATH REGRESSION: %s\n", ok ? "PASS" : "FAIL");
+            free(encoded);
+            coa_model_free(&model); lg_field_free(&field); coa_origin_free(&org);
+#ifdef USE_CUDA
+            if (nt_get_gpu_mode()) gpu_shutdown();
+#endif
+            return ok ? 0 : 5;
+        }
+    }
 
     /* ── Train ───────────────────────────────────────────────────────────── */
     lg_field_reset_counters(&field);

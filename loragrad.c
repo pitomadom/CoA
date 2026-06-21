@@ -5,6 +5,19 @@
  * gradient buffers from notorch tape. Voting blends origin/boundary
  * resonance with parliament consensus and yields a verdict that the caller
  * applies to its own gradients before the optimizer step.
+ *
+ * ── VENDOR-SYNC POLICY (M4, Mythos audit 2026-06-11) ─────────────────────────
+ * Vendored from the canonical loragrad:
+ *     github.com/ariannamethod/loragrad @ 57c5553  (HEAD; no release tag yet —
+ *     pin by SHA until loragrad cuts a tagged release).
+ * Logic is identical to canon (verified by functional diff). The ONLY deltas
+ * are cosmetic: this copy omits canon's `#ifndef LG_STANDALONE` build-guard and
+ * its voided diagnostic origin_score/boundary_score — neither changes behavior.
+ * Corpus-specific verdict thresholds are NOT set here (canon defaults 0.40/0.10
+ * are kept); the host sets them — CoA: coa_immune_init sets 0.20/0.05 for the
+ * DoE corpus, recalibratable per corpus. This is the audit's threshold-drift
+ * fix: the corpus knob is an explicit host parameter, not a buried vendor edit.
+ * RE-SYNC: re-copy canon loragrad.{c,h}; keep thresholds in the host, not here.
  */
 
 #include "loragrad.h"
@@ -149,12 +162,12 @@ int lg_field_init(lg_field_t* f, int n_experts, uint64_t seed) {
         return -2;
     }
 
-    /* Tuned 2026-05-06: DoE corpus origin·boundary = +0.34 (modest separation);
-     * sample scores cluster in +0.10..+0.30 range. Original +0.40 pass
-     * threshold gave 0 PASS verdicts in CoA Phase-1 smoke. Lowered to +0.20
-     * to allow real PASS flow without flattening the verdict cascade. */
-    f->thresh_pass   =  0.20f;
-    f->thresh_weaken =  0.05f;
+    /* Canon defaults (axis-projection scoring, range [-1,+1]). M4 (Mythos audit):
+     * CORPUS-SPECIFIC thresholds are set by the host (CoA: coa_immune_init), NOT
+     * here — keeping canon defaults makes this file logic-identical to
+     * github.com/ariannamethod/loragrad @ 57c5553. See the vendor-sync header. */
+    f->thresh_pass   =  0.40f;
+    f->thresh_weaken =  0.10f;
     f->thresh_freeze = -0.10f;
     f->thresh_scar   =  0.25f;
     f->thresh_dark   =  0.50f;
